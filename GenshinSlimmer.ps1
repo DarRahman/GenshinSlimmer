@@ -1,12 +1,17 @@
 <#
-    GenshinSlimmer v11
+    GenshinSlimmer v12
     - Stubs cutscene videos and audio cache to 0KB to save 30-40+ GB of disk space.
     - Manifest Synchronization Engine: Directly synchronizes Genshin's internal
-      asset database (res_versions_persist) so the in-game patcher validates 0KB
-      stubs as 100% intact, permanently stopping minor update re-downloads.
+      asset databases (res_versions_persist + audio/silence/data persist variants)
+      so the in-game patcher validates 0KB stubs as 100% intact, stopping
+      minor update re-downloads (fixed for 7.1 strict hash validation).
+    - v12 fix for 7.1: also patches the "hash" field (empty-file hash
+      ef46db3751d8e999, same as base_revision), matches remoteName by filename
+      suffix (handles VideoAssets/ prefix changes), and scans ALL *versions*persist*
+      manifests (res + audio) instead of only res_versions_persist.
     - Eliminates restrictive ACL Deny locks (which caused Error -9908 and download loops).
     - Revision Manager: View and sync R/S/D revisions (res_revision, silence_revision, data_revision).
-    - Supports all regions: Mondstadt, Liyue, Inazuma, Sumeru, Fontaine, Natlan, Nod-Krai, Snezhnaya (ZhìDōng / AQ70).
+    - Supports all regions: Mondstadt, Liyue, Inazuma, Sumeru, Fontaine, Natlan, Nod-Krai, Snezhnaya (ZhìDōng / AQ70 / AQ71 - 7.1).
     - Dedicated gender options: Boy Traveler only, Girl Traveler only, or bulk.
     - Handles both .usm and .usm.bak files across StreamingAssets and Persistent folders.
     - Includes interactive game folder scan/analysis mode.
@@ -47,7 +52,7 @@ $UGCSearchPaths = @(
 function Get-GamePath {
     Clear-Host
     Write-Host "=========================================" -ForegroundColor Cyan
-    Write-Host "   GenshinSlimmer v11" -ForegroundColor Yellow
+    Write-Host "   GenshinSlimmer v12" -ForegroundColor Yellow
     Write-Host "   Created by dnullptr" -ForegroundColor DarkGray
     Write-Host "=========================================" -ForegroundColor Cyan
     Write-Host ""
@@ -116,13 +121,92 @@ function Remove-FileLock {
     } catch {}
 }
 
+function Get-ManifestCandidates {
+    param ([string]$GameRoot)
+    $candidates = @()
+    $persistentDir = Join-Path $GameRoot "GenshinImpact_Data\Persistent"
+    $defaultPersist = Join-Path $persistentDir "res_versions_persist"
+    if (Test-Path -LiteralPath $defaultPersist) { $candidates += $defaultPersist }
+    if (Test-Path -LiteralPath $persistentDir) {
+        try {
+            $found = Get-ChildItem -Path $persistentDir -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "*versions*" -and $_.Name -like "*persist*" -and $_.Name -notlike "*.bak" -and $_.FullName -notlike "*.bak" }
+            foreach ($f in $found) {
+                if ($candidates -notcontains $f.FullName) { $candidates += $f.FullName }
+            }
+            # Also catch audio manifest variants that may not contain "persist" in name
+            # e.g. Persistent/AudioAssets/audio_versions, Persistent/audio_lang_*/...
+            $audioFound = Get-ChildItem -Path $persistentDir -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { ($_.Name -like "audio_versions*" -or $_.Name -like "*audio*versions*") -and $_.Name -notlike "*.bak" -and $_.FullName -notlike "*.bak" }
+            foreach ($f in $audioFound) {
+                if ($candidates -notcontains $f.FullName) { $candidates += $f.FullName }
+            }
+        } catch {}
+    }
+    return @($candidates | Select-Object -Unique)
+}
+
+function Get-StubbedFileMap {
+    param ([string]$GameRoot)
+    # Returns hashtable with two lookup styles:
+    #  - Exact keys "StandaloneWindows64/<file>" and "BeyondUGC/<file>" (legacy)
+    #  - Filename-only keys "<file>" for suffix matching (7.1 path-prefix robust)
+    $exactMap = @{}
+    $nameMap = @{}
+    foreach ($relPath in $VideoSearchPaths) {
+        $fullPath = Join-Path $GameRoot $relPath
+        if (Test-Path $fullPath) {
+            $files = Get-ChildItem -Path $fullPath -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -eq 0 }
+            # Fallback: also accept <1KB for legacy stubs created by older versions
+            if (-not $files) {
+                $files = Get-ChildItem -Path $fullPath -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 1024 }
+            }
+            foreach ($f in $files) {
+                $cleanName = if ($f.Name -like "*.bak") { $f.Name.Substring(0, $f.Name.Length - 4) } else { $f.Name }
+                $exactMap["StandaloneWindows64/$cleanName"] = $true
+                $nameMap[$cleanName] = $true
+            }
+        }
+    }
+    foreach ($relPath in $UGCSearchPaths) {
+        $fullPath = Join-Path $GameRoot $relPath
+        if (Test-Path $fullPath) {
+            $files = Get-ChildItem -Path $fullPath -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -eq 0 }
+            if (-not $files) {
+                $files = Get-ChildItem -Path $fullPath -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 1024 }
+            }
+            foreach ($f in $files) {
+                $cleanName = if ($f.Name -like "*.bak") { $f.Name.Substring(0, $f.Name.Length - 4) } else { $f.Name }
+                $exactMap["BeyondUGC/$cleanName"] = $true
+                $nameMap[$cleanName] = $true
+            }
+        }
+    }
+    return @{ Exact = $exactMap; Names = $nameMap }
+}
+
+function Test-ManifestMatch {
+    param ([string]$RemoteName, [hashtable]$ExactMap, [hashtable]$NameMap)
+    if ($ExactMap.ContainsKey($RemoteName)) { return $true }
+    # Suffix match: compare filename only (handles "VideoAssets/StandaloneWindows64/x.usm"
+    # vs "StandaloneWindows64/x.usm" changes in 7.1, plus case variations)
+    $fileName = $RemoteName.Split('/')[-1]
+    if ($NameMap.ContainsKey($fileName)) { return $true }
+    # Case-insensitive fallback
+    foreach ($k in $NameMap.Keys) {
+        if ($k -ieq $fileName) { return $true }
+    }
+    return $false
+}
+
 function Sync-Manifest {
     param ([switch]$Silent)
 
     $CurrentLocation = (Get-Location).ProviderPath
-    $persistPath = Join-Path $CurrentLocation "GenshinImpact_Data\Persistent\res_versions_persist"
-    
-    if (-not (Test-Path $persistPath)) {
+    $manifestPaths = @(Get-ManifestCandidates -GameRoot $CurrentLocation)
+
+    if (-not $manifestPaths -or $manifestPaths.Count -eq 0) {
+        $persistPath = Join-Path $CurrentLocation "GenshinImpact_Data\Persistent\res_versions_persist"
         if (-not $Silent) {
             Write-Host "`nCould not find 'res_versions_persist' at:" -ForegroundColor Yellow
             Write-Host "$persistPath" -ForegroundColor DarkGray
@@ -137,137 +221,179 @@ function Sync-Manifest {
     }
 
     # Map all 0-byte (stubbed) files
-    $stubbedMap = @{}
+    $maps = Get-StubbedFileMap -GameRoot $CurrentLocation
+    $stubbedMap = $maps.Exact
+    $stubbedNames = $maps.Names
 
-    foreach ($relPath in $VideoSearchPaths) {
-        $fullPath = Join-Path $CurrentLocation $relPath
-        if (Test-Path $fullPath) {
-            $files = Get-ChildItem -Path $fullPath -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 1024 }
-            foreach ($f in $files) {
-                $cleanName = if ($f.Name -like "*.bak") { $f.Name.Substring(0, $f.Name.Length - 4) } else { $f.Name }
-                $stubbedMap["StandaloneWindows64/$cleanName"] = $true
+    if ($stubbedNames.Count -eq 0 -and -not $Silent) {
+        Write-Host "No stubbed (0KB) files found. Stub files first, then sync." -ForegroundColor Yellow
+    }
+
+    # Empty-file fingerprints (md5 of 0 bytes + hash of 0 bytes as seen in base_revision).
+    # 7.1 validates "hash" in addition to "fileSize"/"md5"; leaving it stale triggers redownload.
+    $emptyMd5 = "d41d8cd98f00b204e9800998ecf8427e"
+    $emptyHash = "ef46db3751d8e999"
+
+    $totalPatched = 0
+    $perFileCounts = @{}
+
+    foreach ($persistPath in $manifestPaths) {
+        $lines = Get-Content -LiteralPath $persistPath -Encoding utf8
+        $output = [System.Collections.Generic.List[string]]::new($lines.Count)
+        $patchedCount = 0
+
+        foreach ($line in $lines) {
+            $matched = $false
+            if ($line -match '"remoteName":\s*"([^"]+)"') {
+                $remoteName = $matches[1]
+                if (Test-ManifestMatch -RemoteName $remoteName -ExactMap $stubbedMap -NameMap $stubbedNames) {
+                    $newLine = $line -replace '"fileSize":\s*\d+', '"fileSize": 0' `
+                                     -replace '"md5":\s*"[^"]+"', "`"md5`": `"$emptyMd5`""
+                    # Patch hash as well when present (7.1 strict check). If no hash field, this is a no-op.
+                    if ($newLine -match '"hash":') {
+                        $newLine = $newLine -replace '"hash":\s*"[^"]+"', "`"hash`": `"$emptyHash`""
+                    }
+                    $output.Add($newLine)
+                    $patchedCount++
+                    $matched = $true
+                }
+            }
+            if (-not $matched) {
+                $output.Add($line)
             }
         }
-    }
 
-    foreach ($relPath in $UGCSearchPaths) {
-        $fullPath = Join-Path $CurrentLocation $relPath
-        if (Test-Path $fullPath) {
-            $files = Get-ChildItem -Path $fullPath -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 1024 }
-            foreach ($f in $files) {
-                $cleanName = if ($f.Name -like "*.bak") { $f.Name.Substring(0, $f.Name.Length - 4) } else { $f.Name }
-                $stubbedMap["BeyondUGC/$cleanName"] = $true
-            }
+        # Backup original manifest once
+        $backupPath = "$persistPath.bak"
+        if (-not (Test-Path $backupPath)) {
+            try { Copy-Item -LiteralPath $persistPath -Destination $backupPath -Force } catch {}
         }
-    }
 
-    $lines = Get-Content -LiteralPath $persistPath -Encoding utf8
-    $output = [System.Collections.Generic.List[string]]::new($lines.Count)
-    $patchedCount = 0
+        # Ensure file is writable (strip ReadOnly attribute and Deny rules)
+        Remove-FileLock -Path $persistPath
+        try {
+            $persistItem = Get-Item -LiteralPath $persistPath -Force -ErrorAction SilentlyContinue
+            if ($persistItem -and $persistItem.IsReadOnly) { $persistItem.IsReadOnly = $false }
+        } catch {}
 
-    foreach ($line in $lines) {
-        $matched = $false
-        if ($line -match '"remoteName":\s*"([^"]+)"') {
-            $remoteName = $matches[1]
-            if ($stubbedMap.ContainsKey($remoteName)) {
-                $newLine = $line -replace '"fileSize":\s*\d+', '"fileSize": 0' -replace '"md5":\s*"[^"]+"', '"md5": "d41d8cd98f00b204e9800998ecf8427e"'
-                $output.Add($newLine)
-                $patchedCount++
-                $matched = $true
-            }
+        try {
+            [System.IO.File]::WriteAllLines($persistPath, $output, [System.Text.UTF8Encoding]::new($false))
+        } catch {
+            Write-Host "`nError writing to $persistPath : $_" -ForegroundColor Red
+            if (-not $Silent) { Read-Host "Press Enter to continue..." }
+            continue
         }
-        if (-not $matched) {
-            $output.Add($line)
-        }
-    }
-
-    # Backup original manifest once
-    $backupPath = "$persistPath.bak"
-    if (-not (Test-Path $backupPath)) {
-        try { Copy-Item -LiteralPath $persistPath -Destination $backupPath -Force } catch {}
-    }
-
-    # Ensure file is writable (strip ReadOnly attribute and Deny rules)
-    Remove-FileLock -Path $persistPath
-    try {
-        $persistItem = Get-Item -LiteralPath $persistPath -Force -ErrorAction SilentlyContinue
-        if ($persistItem -and $persistItem.IsReadOnly) { $persistItem.IsReadOnly = $false }
-    } catch {}
-
-    try {
-        [System.IO.File]::WriteAllLines($persistPath, $output, [System.Text.UTF8Encoding]::new($false))
-    } catch {
-        Write-Host "`nError writing to res_versions_persist: $_" -ForegroundColor Red
-        if (-not $Silent) { Read-Host "Press Enter to continue..." }
-        return 0
+        $perFileCounts[$persistPath] = $patchedCount
+        $totalPatched += $patchedCount
     }
 
     if (-not $Silent) {
-        Write-Host "Success! Synchronized $patchedCount stubbed assets in res_versions_persist." -ForegroundColor Green
-        Write-Host "The in-game patcher will now treat these 0KB stubs as 100% valid." -ForegroundColor Cyan
+        foreach ($kv in $perFileCounts.GetEnumerator()) {
+            Write-Host ("  {0} : {1} entries" -f (Split-Path $kv.Key -Leaf), $kv.Value) -ForegroundColor DarkGray
+        }
+        if ($totalPatched -eq 0 -and $stubbedNames.Count -gt 0) {
+            Write-Host "`nWARNING: Found $($stubbedNames.Count) stubbed files but patched 0 manifest entries." -ForegroundColor Yellow
+            Write-Host "The manifest remoteName paths may have changed in 7.1." -ForegroundColor Yellow
+            Write-Host "Sample stubbed names:" -ForegroundColor DarkGray
+            $stubbedNames.Keys | Select-Object -First 5 | ForEach-Object { Write-Host "  - $_" -ForegroundColor DarkGray }
+            Write-Host "Check res_versions_persist remoteName format manually." -ForegroundColor DarkGray
+        } else {
+            Write-Host "Success! Synchronized $totalPatched stubbed assets across $($manifestPaths.Count) manifest(s)." -ForegroundColor Green
+            Write-Host "The in-game patcher will now treat these 0KB stubs as 100% valid." -ForegroundColor Cyan
+        }
         Read-Host "Press Enter to return to menu..."
     }
 
-    return $patchedCount
+    return $totalPatched
 }
 
 function Restore-Manifest {
     param ([array]$FileNamesToRestore)
 
     $CurrentLocation = (Get-Location).ProviderPath
-    $persistPath   = Join-Path $CurrentLocation "GenshinImpact_Data\Persistent\res_versions_persist"
-    $streamingPath = Join-Path $CurrentLocation "GenshinImpact_Data\StreamingAssets\res_versions_streaming"
+    $manifestPaths = @(Get-ManifestCandidates -GameRoot $CurrentLocation)
+    if (-not $manifestPaths -or $manifestPaths.Count -eq 0) { return 0 }
 
-    if (-not (Test-Path $persistPath) -or -not (Test-Path $streamingPath)) { return 0 }
-
-    $lookup = @{}
-    $streamingLines = Get-Content -LiteralPath $streamingPath -Encoding utf8
-    foreach ($line in $streamingLines) {
-        if ($line -match '"remoteName":\s*"([^"]+)"') {
-            $lookup[$matches[1]] = $line
-        }
+    # Build global lookup from ALL streaming manifests (res + audio), keyed by
+    # exact remoteName AND by filename for 7.1 path-robust restore.
+    $lookupExact = @{}
+    $lookupByName = @{}
+    $streamingDir = Join-Path $CurrentLocation "GenshinImpact_Data\StreamingAssets"
+    if (Test-Path -LiteralPath $streamingDir) {
+        try {
+            $streamingManifests = Get-ChildItem -Path $streamingDir -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { ($_.Name -like "*versions*streaming*" -or $_.Name -like "res_versions_streaming" -or $_.Name -like "audio_versions*") -and $_.Name -notlike "*.bak" -and $_.FullName -notlike "*.bak" }
+            # Always include the classic res_versions_streaming even if filter misses it
+            $classicStreaming = Join-Path $CurrentLocation "GenshinImpact_Data\StreamingAssets\res_versions_streaming"
+            $allStreaming = @($streamingManifests.FullName) + @($classicStreaming) | Select-Object -Unique
+            foreach ($sp in $allStreaming) {
+                if (-not $sp -or -not (Test-Path -LiteralPath $sp)) { continue }
+                $sLines = Get-Content -LiteralPath $sp -Encoding utf8 -ErrorAction SilentlyContinue
+                foreach ($line in $sLines) {
+                    if ($line -match '"remoteName":\s*"([^"]+)"') {
+                        $rn = $matches[1]
+                        if (-not $lookupExact.ContainsKey($rn)) { $lookupExact[$rn] = $line }
+                        $fn = $rn.Split('/')[-1]
+                        if (-not $lookupByName.ContainsKey($fn)) { $lookupByName[$fn] = $line }
+                    }
+                }
+            }
+        } catch {}
     }
 
-    $restoreMap = @{}
+    if ($lookupExact.Count -eq 0) { return 0 }
+
+    $restoreNames = @{}
     foreach ($fn in $FileNamesToRestore) {
         $cleanName = if ($fn -like "*.bak") { $fn.Substring(0, $fn.Length - 4) } else { $fn }
-        $restoreMap["StandaloneWindows64/$cleanName"] = $true
-        $restoreMap["BeyondUGC/$cleanName"] = $true
+        $restoreNames[$cleanName] = $true
     }
 
-    $persistLines = Get-Content -LiteralPath $persistPath -Encoding utf8
-    $output = [System.Collections.Generic.List[string]]::new($persistLines.Count)
-    $restoredCount = 0
+    $totalRestored = 0
+    foreach ($persistPath in $manifestPaths) {
+        $persistLines = Get-Content -LiteralPath $persistPath -Encoding utf8
+        $output = [System.Collections.Generic.List[string]]::new($persistLines.Count)
+        $restoredCount = 0
 
-    foreach ($line in $persistLines) {
-        $matched = $false
-        if ($line -match '"remoteName":\s*"([^"]+)"') {
-            $remoteName = $matches[1]
-            if ($restoreMap.ContainsKey($remoteName) -and $lookup.ContainsKey($remoteName)) {
-                $output.Add($lookup[$remoteName])
-                $restoredCount++
-                $matched = $true
+        foreach ($line in $persistLines) {
+            $matched = $false
+            if ($line -match '"remoteName":\s*"([^"]+)"') {
+                $remoteName = $matches[1]
+                $fileName = $remoteName.Split('/')[-1]
+                $shouldRestore = $restoreNames.ContainsKey($fileName)
+                if ($shouldRestore) {
+                    if ($lookupExact.ContainsKey($remoteName)) {
+                        $output.Add($lookupExact[$remoteName])
+                        $restoredCount++
+                        $matched = $true
+                    } elseif ($lookupByName.ContainsKey($fileName)) {
+                        $output.Add($lookupByName[$fileName])
+                        $restoredCount++
+                        $matched = $true
+                    }
+                }
+            }
+            if (-not $matched) {
+                $output.Add($line)
             }
         }
-        if (-not $matched) {
-            $output.Add($line)
+
+        # Ensure file is writable (strip ReadOnly attribute and Deny rules)
+        Remove-FileLock -Path $persistPath
+        try {
+            $persistItem = Get-Item -LiteralPath $persistPath -Force -ErrorAction SilentlyContinue
+            if ($persistItem -and $persistItem.IsReadOnly) { $persistItem.IsReadOnly = $false }
+        } catch {}
+
+        try {
+            [System.IO.File]::WriteAllLines($persistPath, $output, [System.Text.UTF8Encoding]::new($false))
+        } catch {
+            Write-Host "`nError writing to $persistPath : $_" -ForegroundColor Red
+            continue
         }
+        $totalRestored += $restoredCount
     }
-
-    # Ensure file is writable (strip ReadOnly attribute and Deny rules)
-    Remove-FileLock -Path $persistPath
-    try {
-        $persistItem = Get-Item -LiteralPath $persistPath -Force -ErrorAction SilentlyContinue
-        if ($persistItem -and $persistItem.IsReadOnly) { $persistItem.IsReadOnly = $false }
-    } catch {}
-
-    try {
-        [System.IO.File]::WriteAllLines($persistPath, $output, [System.Text.UTF8Encoding]::new($false))
-    } catch {
-        Write-Host "`nError writing to res_versions_persist: $_" -ForegroundColor Red
-        return 0
-    }
-    return $restoredCount
+    return $totalRestored
 }
 
 # --- DEFINE PATTERNS ---
@@ -278,7 +404,7 @@ $PatternsSumeru    = @("*Sumeru*", "*Xm_*", "*LQ13*")
 $PatternsFontaine  = @("*Fontaine*", "*LQ14*")
 $PatternsNatlan    = @("*Natlan*", "*LQ15*")
 $PatternsNodKrai   = @("*NodKrai*", "*NK_*", "*LQ16*")
-$PatternsSnezhnaya = @("*ZD_*", "*AQ70*") # Snezhnaya (ZhìDōng / 至冬)
+$PatternsSnezhnaya = @("*ZD_*", "*ZD71*", "*AQ70*", "*AQ71*", "*LQ17*", "*Snezhnaya*") # Snezhnaya (ZhìDōng / 至冬) - 7.0 AQ70 + 7.1 AQ71 (A Rekviem for the Underworld)
 $PatternsMisc      = @("*battlePass*", "*ChangeWeather*", "*EQ*", "*FD_*", "*GY*", "*Memories*", "*Reunion*", "*ShieldingResources*")
 $PatternsBoy       = @("*Boy*.usm*", "*PlayerBoy*.usm*")
 $PatternsGirl      = @("*Girl*.usm*", "*PlayerGirl*.usm*")
@@ -663,9 +789,9 @@ Get-GamePath
 do {
     Clear-Host
     Write-Host "=========================================" -ForegroundColor Cyan
-    Write-Host "   GenshinSlimmer v11" -ForegroundColor Yellow
+    Write-Host "   GenshinSlimmer v12" -ForegroundColor Yellow
     Write-Host "=========================================" -ForegroundColor Cyan
-    Write-Host "Mode: Manifest-Sync Engine + Persistent Support" -ForegroundColor DarkGray
+    Write-Host "Mode: Manifest-Sync Engine + Persistent Support (7.1 fixed)" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "Select content to stub:"
     Write-Host " 1. Mondstadt"
@@ -675,8 +801,8 @@ do {
     Write-Host " 5. Fontaine"
     Write-Host " 6. Natlan"
     Write-Host " 7. Nod-Krai"
-    Write-Host " 8. Snezhnaya (ZhìDōng / 7.0) " -NoNewline
-    Write-Host "[WARNING: FINISH 7.0 AQ First!]" -ForegroundColor Red
+    Write-Host " 8. Snezhnaya (ZhìDōng / 7.0-7.1) " -NoNewline
+    Write-Host "[WARNING: FINISH 7.x AQ First!]" -ForegroundColor Red
     Write-Host " 9. Expired Events & Misc Cutscenes"
     Write-Host "10. UGC Cache (BeyondUGC)"
     Write-Host "11. Stub 'Boy' Traveler Videos Only" -ForegroundColor Cyan
