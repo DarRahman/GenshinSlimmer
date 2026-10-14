@@ -10,7 +10,15 @@ This repository contains a single script which:
 
 ### Version
 
-- **Current script version: v11**
+- **Current script version: v12**
+
+  
+### What's new in v12 (2026 Oct 14)
+- **Fix for 7.1**: also patches the "hash" field, matches remoteName by filename
+      suffix (handles VideoAssets/ prefix changes), and scans ALL versions persist
+      manifests (res + audio) instead of only res_versions_persist.
+- **New Regexes for Snezhnaya**: Snezhnaya patterns extended for 7.1: *ZD71*, *AQ71*, *LQ17*, *Snezhnaya*.
+- **QoL syncs and cleanups**: Fitting 7.1 changes. (Thanks [@CiTyMrX](https://github.com/CiTyMrX) for the contribution)
 
 ### What's new in v11 (2026 Sep 24) - Major Improvements!
 - **Manifest Synchronization Engine (`[M]`):** Completely replaces restrictive Windows ACL Deny locks with direct `res_versions_persist` manifest synchronization. Stubbed 0KB files are registered as valid 0KB assets in the game's own asset database, passing integrity verification instantly and permanently stopping in-game patch re-downloads.
